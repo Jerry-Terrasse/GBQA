@@ -25,7 +25,6 @@ def test_reporter_writes_extended_json_and_compatible_markdown(temp_dir) -> None
                     execution={
                         "attempts": [],
                         "diagnostics": {"backend_type": "game_client"},
-                        "suspected_origin": "environment",
                     },
                 ),
                 planner_prompt="prompt",

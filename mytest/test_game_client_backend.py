@@ -53,5 +53,5 @@ def test_game_client_backend_contract() -> None:
 
     assert result.observation.success is True
     assert result.observation.summary.startswith("You look around.")
-    assert result.observation.execution["suspected_origin"] == "environment"
+    assert "suspected_origin" not in result.observation.execution
     backend.close_session(session)

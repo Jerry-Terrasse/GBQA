@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
+import sys
 from typing import Any, Dict, List, Optional
 
 from .bug_detector import BugDetector
@@ -218,7 +219,7 @@ class Orchestrator:
                         step,
                     )
                 self._reporter.write_report(report)
-                # input("[debug] Press Enter to continue...")
+                # sys.stdin.isatty() and input("[debug] Press Enter to continue...")
                 if current_observation.game_over:
                     break
                 if consecutive_failures >= self._max_consecutive_failures:
@@ -281,9 +282,9 @@ class Orchestrator:
         consecutive_failures: int,
     ) -> bool:
         suspected_origin = str(
-            (observation.execution or {}).get("suspected_origin", "environment")
+            (observation.execution or {}).get("suspected_origin", "")
         )
-        if suspected_origin == "execution":
+        if not observation.success and suspected_origin == "execution":
             return False
         if action.bug_exist and action.confidence >= self._confidence_threshold:
             return True
@@ -292,7 +293,7 @@ class Orchestrator:
         return (
             self._reflection_interval > 0
             and (step - last_reflection_step) >= self._reflection_interval
-            and suspected_origin in {"environment", "ambiguous"}
+            and (observation.success or suspected_origin in {"environment", "ambiguous", ""})
         )
 
     def _promote_reflection_bug(

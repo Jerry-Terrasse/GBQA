@@ -36,7 +36,6 @@ class OperatorStub:
                     execution={
                         "attempts": [],
                         "diagnostics": {"source": "describe_capabilities"},
-                        "suspected_origin": "environment",
                     },
                 ),
                 "attempts": [],

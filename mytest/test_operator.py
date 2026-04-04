@@ -86,7 +86,6 @@ class RetryBackend:
             execution={
                 "attempts": [],
                 "diagnostics": {},
-                "suspected_origin": "environment",
             },
         )
         return BackendExecutionResult(
@@ -97,7 +96,6 @@ class RetryBackend:
                     translated_calls=request.calls,
                     success=True,
                     final_status="completed",
-                    suspected_origin="environment",
                 )
             ],
             diagnostics={},
