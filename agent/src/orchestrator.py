@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
 from pathlib import Path
-import sys
 from typing import Any, Dict, List, Optional
 
 from .bug_detector import BugDetector
@@ -220,7 +219,7 @@ class Orchestrator:
                         step,
                     )
                 self._reporter.write_report(report)
-                # sys.stdin.isatty() and input("[debug] Press Enter to continue...")
+                # import sys; sys.stdin.isatty() and input("[debug] Press Enter to continue...")
                 if current_observation.game_over:
                     break
                 if consecutive_failures >= self._max_consecutive_failures:
