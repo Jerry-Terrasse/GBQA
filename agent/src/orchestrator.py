@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+import json
+from typing import Any, Dict, List, Optional
 
 from .bug_detector import BugDetector
 from .evaluator import Evaluator
-from .tool_registry import ToolRegistry
+from .execution_backends import ExecutionBackend
 from .memory import MemoryManager
-from .observer import ObservationParser
+from .operator import Operator
 from .planner import ActionPlanner
-from .reporter import Reporter
 from .reflection import ReflectionAnalyzer
+from .reporter import Reporter
 from .types import BugFinding, Observation, RunReport, StepRecord
 
 
@@ -23,10 +24,11 @@ class Orchestrator:
     def __init__(
         self,
         game_id: str,
-        tool_registry: ToolRegistry,
+        execution_backend: ExecutionBackend,
+        operator: Operator,
         planner: ActionPlanner,
         memory: MemoryManager,
-        detector: BugDetector,
+        detector: Optional[BugDetector],
         reporter: Reporter,
         evaluator: Optional[Evaluator],
         max_steps: int,
@@ -38,7 +40,8 @@ class Orchestrator:
         summary_interval: int,
     ) -> None:
         self._game_id = game_id
-        self._tool_registry = tool_registry
+        self._execution_backend = execution_backend
+        self._operator = operator
         self._planner = planner
         self._memory = memory
         self._detector = detector
@@ -51,20 +54,31 @@ class Orchestrator:
         self._confidence_threshold = confidence_threshold
         self._reflection_interval = reflection_interval
         self._summary_interval = summary_interval
-        self._parser = ObservationParser()
 
     def run(self, game_profile: str) -> RunReport:
         start = datetime.now(timezone.utc).isoformat()
-        initial_payload = self._tool_registry.invoke("game_new", {})
-        game_session_id = initial_payload.get("game_id", "")
-        initial_observation = self._parser.parse(
-            {
-                "success": initial_payload.get("success", False),
-                "message": initial_payload.get("message", ""),
-                "state": initial_payload.get("state", {}),
-                "game_over": False,
-                "turn": 0,
-            }
+        print(
+            f"[session] starting backend session: "
+            f"backend={self._execution_backend.backend_type} game={self._game_id}"
+        )
+        session = self._execution_backend.start_session(
+            {"game_id": self._game_id, "game_profile": game_profile}
+        )
+        print(
+            f"[session] backend session started: "
+            f"backend={session.backend_type} session_id={session.session_id}"
+        )
+        capability = self._execution_backend.describe_capabilities(session, refresh=False)
+        base_initial_observation = session.initial_observation or Observation(
+            success=True,
+            message="Session started.",
+            state={},
+            summary="Session started.",
+            env_state={},
+        )
+        initial_observation = self._inject_capability_observation(
+            base_initial_observation,
+            capability.planner_summary,
         )
 
         report = RunReport(
@@ -72,117 +86,149 @@ class Orchestrator:
             steps=[],
             bugs=[],
             summaries=[],
-            metadata={"start_time": start, "game_session_id": game_session_id},
+            metadata={
+                "start_time": start,
+                "session_id": session.session_id,
+                "backend": {"type": session.backend_type},
+                "capability_summary": capability.planner_summary,
+            },
         )
 
         current_observation = initial_observation
         consecutive_failures = 0
         last_reflection_step = 0
         last_summary_step = 0
-        for step in range(1, self._max_steps + 1):
-            context = self._build_context(game_profile, current_observation)
-            plan = self._planner.plan(context)
-            if plan.error:
-                report.metadata["early_stop_reason"] = "planner_error"
-                report.metadata["failed_stage"] = "planner"
-                report.metadata["failed_step"] = step
-                report.metadata["llm_error"] = plan.error
-                break
-            action = plan.action
-            raw_response = self._tool_registry.invoke(
-                "game_command", {"game_id": game_session_id, "command": action.command}
-            )
-            current_observation = self._parser.parse(raw_response)
-            record = StepRecord(
-                step=step,
-                action=action,
-                observation=current_observation,
-                planner_prompt=plan.prompt,
-                planner_output=plan.output,
-            )
-            report.steps.append(record)
 
-            findings = self._detector.inspect(action, current_observation)
-            for bug in findings:
-                report.bugs.append(bug)
-                self._memory.record_bug(bug, step)
-                self._reporter.log_bug(bug, step)
-
-            if current_observation.success:
-                consecutive_failures = 0
-            elif self._detector.is_benign_failure(current_observation):
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-
-            should_reflect = False
-            reflection = None
-            fatal_llm_error = ""
-            if action.bug_exist and action.confidence >= self._confidence_threshold:
-                should_reflect = True
-            if findings or consecutive_failures >= self._reflection_threshold:
-                should_reflect = True
-            if (
-                self._reflection_interval > 0
-                and (step - last_reflection_step) >= self._reflection_interval
-            ):
-                should_reflect = True
-            if self._reflection_analyzer and should_reflect:
-                reflection = self._reflection_analyzer.reflect(context)
-                record.notes = self._reflection_analyzer.format_note(reflection)
-                record.reflection_prompt = reflection.prompt
-                record.reflection_output = reflection.output
-                last_reflection_step = step
-                if reflection.error:
-                    fatal_llm_error = reflection.error
-                promoted_bug = self._promote_reflection_bug(
-                    reflection=reflection,
-                    step=step,
-                    action_command=action.command,
+        try:
+            for step in range(1, self._max_steps + 1):
+                context = self._build_context(
+                    game_profile=game_profile,
                     observation=current_observation,
-                    existing_bugs=report.bugs,
                 )
-                if promoted_bug is not None:
-                    report.bugs.append(promoted_bug)
-                    self._memory.record_bug(promoted_bug, step)
-                    self._reporter.log_bug(promoted_bug, step)
+                plan = self._planner.plan(context)
+                if plan.error:
+                    report.metadata["early_stop_reason"] = "planner_error"
+                    report.metadata["failed_stage"] = "planner"
+                    report.metadata["failed_step"] = step
+                    report.metadata["llm_error"] = plan.error
+                    break
 
-            self._memory.record_step(record)
-            self._reporter.log_step(record)
-            if fatal_llm_error:
-                report.metadata["early_stop_reason"] = "reflection_error"
-                report.metadata["failed_stage"] = "reflection"
-                report.metadata["failed_step"] = step
-                report.metadata["llm_error"] = fatal_llm_error
+                action = plan.action
+                execution_result = self._operator.execute(
+                    action=action,
+                    current_observation=current_observation,
+                    capability=capability,
+                    session=session,
+                    backend=self._execution_backend,
+                )
+                refreshed_capability = getattr(
+                    execution_result,
+                    "refreshed_capability",
+                    None,
+                )
+                if refreshed_capability is not None:
+                    capability = refreshed_capability
+                current_observation = execution_result.observation
+
+                record = StepRecord(
+                    step=step,
+                    action=action,
+                    observation=current_observation,
+                    planner_prompt=plan.prompt,
+                    planner_output=plan.output,
+                    capability_summary=capability.planner_summary,
+                )
+                report.steps.append(record)
+
+                findings = self._detector.inspect(action, current_observation) if self._detector else []
+                for bug in findings:
+                    report.bugs.append(bug)
+                    self._memory.record_bug(bug, step)
+                    self._reporter.log_bug(bug, step)
+
+                if current_observation.success:
+                    consecutive_failures = 0
+                elif self._detector and self._detector.is_benign_failure(current_observation):
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
+                should_reflect = self._should_reflect(
+                    action=action,
+                    observation=current_observation,
+                    findings=findings,
+                    step=step,
+                    last_reflection_step=last_reflection_step,
+                    consecutive_failures=consecutive_failures,
+                )
+                reflection = None
+                fatal_llm_error = ""
+                if self._reflection_analyzer and should_reflect:
+                    reflection_context = self._build_context(
+                        game_profile=game_profile,
+                        observation=current_observation,
+                    )
+                    reflection = self._reflection_analyzer.reflect(reflection_context)
+                    record.notes = self._reflection_analyzer.format_note(reflection)
+                    record.reflection_prompt = reflection.prompt
+                    record.reflection_output = reflection.output
+                    last_reflection_step = step
+                    if reflection.error:
+                        fatal_llm_error = reflection.error
+                    promoted_bug = self._promote_reflection_bug(
+                        reflection=reflection,
+                        step=step,
+                        action_command=action.command,
+                        observation=current_observation,
+                        existing_bugs=report.bugs,
+                    )
+                    if promoted_bug is not None:
+                        report.bugs.append(promoted_bug)
+                        self._memory.record_bug(promoted_bug, step)
+                        self._reporter.log_bug(promoted_bug, step)
+
+                self._memory.record_step(record)
+                self._reporter.log_step(record)
+                if fatal_llm_error:
+                    report.metadata["early_stop_reason"] = "reflection_error"
+                    report.metadata["failed_stage"] = "reflection"
+                    report.metadata["failed_step"] = step
+                    report.metadata["llm_error"] = fatal_llm_error
+                    self._reporter.write_report(report)
+                    break
+
+                summary_record = None
+                if plan.error and "context" in plan.error.lower():
+                    summary_record = self._memory.force_summarize(step)
+                if reflection and reflection.error and "context" in reflection.error.lower():
+                    summary_record = self._memory.force_summarize(step)
+                if (
+                    not summary_record
+                    and self._summary_interval > 0
+                    and (step - last_summary_step) >= self._summary_interval
+                ):
+                    summary_record = self._memory.force_summarize(step)
+                if not summary_record:
+                    summary_record = self._memory.maybe_summarize(step)
+                if summary_record:
+                    report.summaries.append(summary_record)
+                    last_summary_step = step
+                    self._reporter.log_summary(
+                        {"prompt": summary_record.prompt, "output": summary_record.output},
+                        step,
+                    )
                 self._reporter.write_report(report)
-                break
-
-            summary_record = None
-            if plan.error and "context" in plan.error.lower():
-                summary_record = self._memory.force_summarize(step)
-            if reflection and reflection.error and "context" in reflection.error.lower():
-                summary_record = self._memory.force_summarize(step)
-            if (
-                not summary_record
-                and self._summary_interval > 0
-                and (step - last_summary_step) >= self._summary_interval
-            ):
-                summary_record = self._memory.force_summarize(step)
-            if not summary_record:
-                summary_record = self._memory.maybe_summarize(step)
-            if summary_record:
-                report.summaries.append(summary_record)
-                last_summary_step = step
-                self._reporter.log_summary(
-                    {"prompt": summary_record.prompt, "output": summary_record.output},
-                    step,
-                )
-            self._reporter.write_report(report)
-            if current_observation.game_over:
-                break
-            if consecutive_failures >= self._max_consecutive_failures:
-                report.metadata["early_stop_reason"] = "max_consecutive_failures"
-                break
+                # input("[debug] Press Enter to continue...")
+                if current_observation.game_over:
+                    break
+                if consecutive_failures >= self._max_consecutive_failures:
+                    report.metadata["early_stop_reason"] = "max_consecutive_failures"
+                    break
+        finally:
+            try:
+                self._execution_backend.close_session(session)
+            except Exception as exc:  # noqa: BLE001
+                report.metadata["session_close_error"] = str(exc)
 
         report.summary = self._memory.get_long_term_summary()
         report.metadata["end_time"] = datetime.now(timezone.utc).isoformat()
@@ -197,6 +243,57 @@ class Orchestrator:
                 "details": [detail.__dict__ for detail in result.details],
             }
         return report
+
+    @staticmethod
+    def _inject_capability_observation(
+        observation: Observation,
+        capability_text: str,
+    ) -> Observation:
+        capability_text = capability_text.strip()
+        if not capability_text:
+            return observation
+        base_text = (observation.summary or observation.message or "").strip()
+        sections = [f"Capability observation:\n{capability_text}"]
+        if base_text:
+            sections.append(f"Initial environment observation:\n{base_text}")
+        combined_text = "\n\n".join(sections).strip()
+        return Observation(
+            success=observation.success,
+            message=combined_text,
+            state=observation.state,
+            raw=observation.raw,
+            game_over=observation.game_over,
+            turn=observation.turn,
+            summary=combined_text,
+            env_state=observation.env_state,
+            artifacts=observation.artifacts,
+            execution=observation.execution,
+        )
+
+    def _should_reflect(
+        self,
+        *,
+        action: Any,
+        observation: Observation,
+        findings: List[BugFinding],
+        step: int,
+        last_reflection_step: int,
+        consecutive_failures: int,
+    ) -> bool:
+        suspected_origin = str(
+            (observation.execution or {}).get("suspected_origin", "environment")
+        )
+        if suspected_origin == "execution":
+            return False
+        if action.bug_exist and action.confidence >= self._confidence_threshold:
+            return True
+        if findings or consecutive_failures >= self._reflection_threshold:
+            return True
+        return (
+            self._reflection_interval > 0
+            and (step - last_reflection_step) >= self._reflection_interval
+            and suspected_origin in {"environment", "ambiguous"}
+        )
 
     def _promote_reflection_bug(
         self,
@@ -220,7 +317,8 @@ class Orchestrator:
             confidence=float(reflection.bug_confidence),
             evidence={
                 "command": action_command,
-                "observation": observation.message,
+                "observation": observation.summary or observation.message,
+                "execution": observation.execution,
                 "next_check": reflection.next_check,
                 "step": step,
             },
@@ -245,28 +343,17 @@ class Orchestrator:
                 return True
         return False
 
-    @staticmethod
-    def _is_fatal_llm_error(error: str) -> bool:
-        lowered = (error or "").lower()
-        if not lowered:
-            return False
-        return any(
-            token in lowered
-            for token in (
-                "ratelimiterror",
-                "rate limit",
-                "quota",
-                "error code: 429",
-            )
-        )
-
     def _build_context(
-        self, game_profile: str, observation: Observation
+        self,
+        *,
+        game_profile: str,
+        observation: Observation,
     ) -> Dict[str, Any]:
-        hud_text = self._build_hud_text(observation)
-        observation_text = observation.message
-        if hud_text:
-            observation_text = f"{observation_text}\n\n{hud_text}"
+        observation_text = observation.summary or observation.message
+        execution_diagnostics = json.dumps(
+            (observation.execution or {}).get("diagnostics", {}),
+            ensure_ascii=False,
+        )
         cross_session_memory = ""
         query = "\n".join([observation_text, self._memory.get_long_term_summary()])
         hits = self._memory.get_cross_session_memories(query)
@@ -287,35 +374,6 @@ class Orchestrator:
             "memory_summary": memory_summary,
             "recent_trace": recent_trace,
             "current_observation": observation_text,
+            "execution_diagnostics": execution_diagnostics,
             "turn": observation.turn or 0,
         }
-
-    def _build_hud_text(self, observation: Observation) -> str:
-        state = observation.state or {}
-        room = state.get("room", {}) if isinstance(state, dict) else {}
-        room_name = room.get("name", "")
-        exits = room.get("exits", [])
-        exit_text = ", ".join(exits) if isinstance(exits, list) else ""
-        inventory = state.get("inventory", [])
-        inventory_count = len(inventory) if isinstance(inventory, list) else 0
-        lit_items = []
-        if isinstance(inventory, list):
-            for item in inventory:
-                if not isinstance(item, dict):
-                    continue
-                item_state = item.get("state", {})
-                if isinstance(item_state, dict) and item_state.get("lit") is True:
-                    lit_items.append(item.get("name", "unknown"))
-        light_source_text = "on" if lit_items else "off"
-        can_see = state.get("can_see", None)
-        visibility_text = "on" if can_see else "off" if can_see is not None else "unknown"
-        if not any([room_name, exit_text, inventory_count, light_source_text, visibility_text]):
-            return ""
-        return (
-            f"current room={room_name or 'unknown'}, "
-            f"inventory load={inventory_count}/6, "
-            f"current turn={observation.turn or 0}, "
-            f"light_source={light_source_text}, "
-            f"visibility={visibility_text}, "
-            f"exits=[{exit_text}]"
-        )
