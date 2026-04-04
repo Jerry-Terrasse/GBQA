@@ -52,6 +52,7 @@ Useful commands:
 - The orchestrator owns session lifecycle: it starts one backend session per run and closes it in the run-level `finally` path.
 - The default backend remains `game_client`, wrapped by `GameClientExecutionBackend`.
 - A `playwright_mcp` backend and `computeruse` module now exist, but this path should still be treated as an evolving browser pilot rather than a fully proven default runtime.
+- The `playwright_mcp` path now supports screenshot actions. Screenshot artifacts are stored under `Observation.artifacts["screenshots"]`, and the planner can consume them through multimodal input.
 - The observation model is still summary-first, but now includes normalized `summary`, `env_state`, `artifacts`, and `execution` fields in addition to the legacy compatibility fields.
 - Reports are written incrementally during a run.
 
@@ -89,6 +90,7 @@ These are not the same thing.
 - When debugging operator/backend failures, inspect `steps[].environment.execution.suspected_origin` before calling something a gameplay bug.
 - Execution-layer failures should not be promoted as game bugs unless downstream reflection/evidence clearly reclassifies them as environment issues.
 - Many LLM failures in this repo are provider/model-access problems rather than local code bugs.
+- CAMEL does not automatically convert local image-path strings into uploaded image payloads. For multimodal prompts, pass `PIL.Image` objects rather than filesystem-path strings.
 - `llm.timeout` in `agent/config.yaml` also affects the HTTP game client timeout in `run_agent.py`.
 
 ## Change Guidance
@@ -119,6 +121,8 @@ Useful test files include:
 - `agent/test/test_camel_runtime_fallback.py`
 - `agent/test/test_game_client_backend_loop.py`
 - `agent/test/test_describe_capabilities.py`
+- `agent/test/test_planner_multimodal.py`
+- `agent/test/test_playwright_screenshot_artifact.py`
 - `agent/test/test_report_markdown_compat.py`
 - `agent/test/test_orchestrator_bug_promotion.py`
 - `agent/test/test_bug_detector.py`
