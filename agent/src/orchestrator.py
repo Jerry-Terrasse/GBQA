@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
+from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -375,6 +376,41 @@ class Orchestrator:
             "memory_summary": memory_summary,
             "recent_trace": recent_trace,
             "current_observation": observation_text,
+            "current_artifacts": self._artifact_summary(observation),
+            "observation_images": self._observation_images(observation),
             "execution_diagnostics": execution_diagnostics,
             "turn": observation.turn or 0,
         }
+
+    @staticmethod
+    def _artifact_summary(observation: Observation) -> str:
+        screenshots = observation.artifacts.get("screenshots", [])
+        if not isinstance(screenshots, list) or not screenshots:
+            return ""
+        labels = []
+        for item in screenshots:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            path = str(item.get("path", "")).strip()
+            if label:
+                labels.append(label)
+            elif path:
+                labels.append(Path(path).name)
+        if not labels:
+            return ""
+        return "Attached screenshots: " + ", ".join(labels)
+
+    @staticmethod
+    def _observation_images(observation: Observation) -> List[str]:
+        screenshots = observation.artifacts.get("screenshots", [])
+        if not isinstance(screenshots, list):
+            return []
+        image_paths = []
+        for item in screenshots:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "")).strip()
+            if path:
+                image_paths.append(path)
+        return image_paths
