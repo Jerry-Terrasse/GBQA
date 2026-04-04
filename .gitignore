@@ -180,6 +180,7 @@ logs/
 tmp/
 temp/
 .playwright-mcp/
+.codex
 
 
 # ========================================
